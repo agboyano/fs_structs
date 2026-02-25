@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fs_structs"
+version = "0.0.1a"
+description = "Estructuras de datos para sistemas de ficheros compartidos."
+requires-python = ">=3.9"
+dependencies = []
