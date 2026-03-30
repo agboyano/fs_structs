@@ -367,16 +367,27 @@ class FSList:
         Raises IndexError if no data available in list
         Raises LockingError if couldn't get Lock or timeout trying
         """
-        if self.fast:
-            ix = self.keys()[0]
-            v = self.data.pop(ix)
-            return v
-        else:
-            with lock_context(self.data.base_path, "pop_left_lock", timeout, watchdog_timeout, wait):
-                ix = self.keys()[0]
-                v = self.data.pop(ix)
-                return v
-        raise IndexError("pop_left: empty list") # It should not happen
+        
+        # debería hacer lock en todas las operaciones de escritura.
+        # puede dar error si coincide que está escribiendo y hace un rename.
+        # prefiero hacer seguro el pop_left. menos movimiento.
+        n=0
+        while n < 10:
+            try:
+                if self.fast:
+                    ix = self.keys()[0]
+                    v = self.data.pop(ix)
+                    return v
+                else:
+                    with lock_context(self.data.base_path, "pop_left_lock", timeout, watchdog_timeout, wait):
+                        ix = self.keys()[0]
+                        v = self.data.pop(ix)
+                        return v
+                raise IndexError("pop_left: empty list") # It should not happen
+            except PermissionError:
+                sleep(0.1, 0.2)
+                n +=1
+        raise PermissionError("pop_left error. Probably file is being written.")
 
 
 class FSNamespace:
