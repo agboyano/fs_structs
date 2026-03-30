@@ -368,11 +368,12 @@ class FSList:
         Raises LockingError if couldn't get Lock or timeout trying
         """
         
-        # debería hacer lock en todas las operaciones de escritura.
-        # puede dar error si coincide que está escribiendo y hace un rename.
-        # prefiero hacer seguro el pop_left. menos movimiento.
+        # El único instante en el que debería haber un problema, con fast=False,
+        # es si coincide el momento del rename de escritura (append) con el de 
+        # extracción. Prefiero hacer seguro el pop_left, y no meter locks
+        # innecesarios en escritura.
         n=0
-        while n < 10:
+        while n < 3:
             try:
                 if self.fast:
                     ix = self.keys()[0]
