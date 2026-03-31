@@ -120,10 +120,10 @@ class FSUDict:
                 self.dump(value, temp_path)
 
                 try:
-                    temp_path.rename(target_path)
+                    temp_path.replace(target_path)
                 except (FileExistsError, PermissionError):
                     target_path.unlink()
-                    temp_path.rename(target_path)
+                    temp_path.replace(target_path)
             finally:
                 if temp_path.exists():
                     temp_path.unlink()
@@ -192,7 +192,7 @@ class FSUDict:
             else:
                 temp_path = self.temp_dir / f"tmp_{uuid.uuid4().hex}"
                 target_path = self.base_path / self._key_to_filename(key)
-                target_path.rename(temp_path)
+                target_path.replace(temp_path)
                 value = self.load(temp_path)
                 temp_path.unlink()
             return value
@@ -369,7 +369,7 @@ class FSList:
         """
         
         # El único instante en el que debería haber un problema, con fast=False,
-        # es si coincide el momento del rename de escritura (append) con el de 
+        # es si coincide el momento del replace de escritura (append) con el de 
         # extracción. Prefiero hacer seguro el pop_left, y no meter locks
         # innecesarios en escritura.
         n=0
