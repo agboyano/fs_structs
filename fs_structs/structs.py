@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Mapping, Iterable
 
 import joblib
 
@@ -175,8 +176,12 @@ class FSUDict:
         """
 
     def update(self, iterable):
-        for k, v in iterable:
-            self[k] = v
+        if isinstance(iterable, Mapping):
+            for k in iterable:
+                self[k] = iterable[k]
+        else:
+            for k, v in iterable:
+                self[k] = v
 
     def get(self, key, default=None):
         if key in self:
