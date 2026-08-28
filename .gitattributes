@@ -1,0 +1,3 @@
+# Notebooks are stored without outputs: run `nbstripout --install` once
+# (pip install nbstripout) so this filter is wired into your clone.
+*.ipynb filter=nbstripout diff=ipynb
