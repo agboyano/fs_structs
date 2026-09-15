@@ -4,7 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fs_structs"
-version = "0.0.1a"
-description = "Estructuras de datos para sistemas de ficheros compartidos."
+version = "0.0.2a0"
+description = "Dict, list and namespace data structures stored on a shared directory (local disk, SMB or NFS)."
+readme = "README.md"
 requires-python = ">=3.9"
-dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = ["joblib", "watchdog>=3"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["fs_structs", "fs_structs.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
