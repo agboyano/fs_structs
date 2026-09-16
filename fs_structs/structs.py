@@ -409,6 +409,12 @@ joblib_serializer = FSSerializer(joblib_dump, joblib_load, "jbl")
 #   extension and names that do not decode (Thumbs.db, desktop.ini, orphan temp files).
 # - _key_to_filename raises ValueError when the name exceeds 255 characters or, on Windows
 #   without LongPathsEnabled, when the full path exceeds 259 characters.
+# - clear() is shutil.rmtree + mkdir and is NOT concurrency-safe, by design (administrative
+#   operation): rmtree is file by file, so a failure leaves a partial state; a concurrent
+#   writer's rename into the removed directory raises FileNotFoundError (not retried); lock
+#   directories inside are removed; on Windows a process that has a file open or a
+#   ReadDirectoryChangesW watch on the directory (a blocked pop_left) can make the rmtree
+#   or the mkdir fail. Readers only see KeyError. Per-file atomicity is never violated.
 class FSUDict:
     """Unordered dict stored as one file per key in a directory.
 
@@ -427,10 +433,11 @@ class FSUDict:
         base_path (str | Path): Directory where the values are stored. Created if missing.
         temp_dir (str | Path): Directory for temporary files. Same volume as ``base_path``.
         serializer (FSSerializer): How values are written and read. Default: joblib.
-        fast (bool): If True, values are written directly, without the temporary file.
-            Faster, but a reader may see a partial file. Default False.
+        fast (bool): If True, values are written directly, without atomic operations.
+            Faster, but not safe for distributed processes: a reader may see a partial
+            file. Default False.
         clean (bool): If True, the dict is emptied (``clear()``) before it is returned.
-            Default False.
+            Default False. ``clean=True`` is not atomic (see ``clear()``).
 
     Keys must be Python literals: str, int, float, bytes, None, and tuples, lists, dicts or
     sets made of them. ``repr(key)`` should stay under about 125 characters.
@@ -730,6 +737,11 @@ class FSUDict:
         The whole directory is deleted and created again, so lock directories inside it
         are deleted too.
 
+        Not safe with other processes: call it only when no other process is using the
+        dict, for example when a job starts (see ``clean=True``). It is not atomic, and a
+        process writing at the same time can fail with ``FileNotFoundError``. The data of
+        other keys is never corrupted.
+
         Examples:
             >>> import tempfile
             >>> from fs_structs.structs import FSUDict
@@ -1026,10 +1038,11 @@ class FSList:
         base_path (str | Path): Directory where the elements are stored. Created if missing.
         temp_dir (str | Path): Directory for temporary files. Same volume as ``base_path``.
         serializer (FSSerializer): How elements are written and read. Default: joblib.
-        fast (bool): If True, no temporary files and no lock in ``pop_left``. Only for a
-            single process. Default False.
-        clean (bool): If True, the list is emptied (``clear()``) before it is returned.
+        fast (bool): If True, elements are written without atomic operations and
+            ``pop_left`` takes no lock. Faster, but not safe for distributed processes.
             Default False.
+        clean (bool): If True, the list is emptied (``clear()``) before it is returned.
+            Default False. ``clean=True`` is not atomic (see ``clear()``).
 
     See Also:
         FSUDict: The storage under the list.
@@ -1251,6 +1264,10 @@ class FSList:
     def clear(self):
         """Remove every element.
 
+        Not safe with other processes: stop producers and consumers first. Clearing a
+        queue while consumers run has no defined result; a consumer blocked in
+        ``pop_left`` may also fail, on Windows, when its directory is removed under it.
+
         Examples:
             >>> import tempfile
             >>> from fs_structs.structs import FSList
@@ -1457,7 +1474,8 @@ class FSNamespace:
             ``base_path/tmp``. Must be on the same volume as ``base_path``.
         serializer (FSSerializer): Serializer for every variable. Default: joblib.
         clean (bool): If True, every variable and sub-namespace is removed (``clear()``)
-            before the namespace is returned. Default False.
+            before the namespace is returned. Default False. ``clean=True`` is not atomic
+            (see ``clear()``).
 
     See Also:
         FSUDict: The dict returned by ``udict``.
@@ -1544,7 +1562,7 @@ class FSNamespace:
             name (str): Variable name.
             fast (bool): Passed to ``FSUDict``. Default False.
             clean (bool): If True, the dict is emptied (``clear()``) before it is returned.
-                Default False.
+                Default False. ``clean=True`` is not atomic (see ``clear()``).
 
         Returns:
             FSUDict: The dict.
@@ -1579,7 +1597,7 @@ class FSNamespace:
             name (str): Variable name.
             fast (bool): Passed to ``FSList``. Default False.
             clean (bool): If True, the list is emptied (``clear()``) before it is returned.
-                Default False.
+                Default False. ``clean=True`` is not atomic (see ``clear()``).
 
         Returns:
             FSList: The list.
@@ -1613,6 +1631,7 @@ class FSNamespace:
             name (str): Variable name.
             clean (bool): If True, everything under the sub-namespace is removed
                 (``clear()``) before it is returned. The parent is not touched. Default False.
+                ``clean=True`` is not atomic (see ``clear()``).
 
         Returns:
             FSNamespace: The sub-namespace. It shares ``temp_dir`` and the serializer.
@@ -1644,6 +1663,10 @@ class FSNamespace:
 
     def clear(self, clear_tmp=True):
         """Remove every variable and sub-namespace.
+
+        Not safe with other processes: call it only when no other process is using the
+        namespace. With ``clear_tmp=True`` (default) it also removes temporary files that
+        another process may be writing at that moment, and that process fails.
 
         Args:
             clear_tmp (bool): If True, also remove the library's ``tmp_*`` files from
@@ -1775,7 +1798,7 @@ class FSNamespace:
             name (str): Variable name.
             fast (bool): Passed to ``FSUDict`` or ``FSList``. Ignored for namespaces.
             clean (bool): If True, the variable is emptied (``clear()``) before it is
-                returned. Default False.
+                returned. Default False. ``clean=True`` is not atomic (see ``clear()``).
 
         Returns:
             FSUDict | FSList | FSNamespace: The variable.
