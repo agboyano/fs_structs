@@ -22,4 +22,7 @@ test = ["pytest"]
 include = ["fs_structs", "fs_structs.*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# The docstring examples of the package are doctests and run with the suite.
+testpaths = ["tests", "fs_structs"]
+addopts = "--doctest-modules"
+doctest_optionflags = "NORMALIZE_WHITESPACE ELLIPSIS"

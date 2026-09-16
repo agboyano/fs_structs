@@ -360,3 +360,70 @@ def test_sleep_helper():
     structs.sleep(0.01)
     structs.sleep(0.01, 0.02)
     assert time.perf_counter() - t0 >= 0.02
+
+
+# --------------------------------------------------------------------------- clean
+
+
+def test_clean_argument_empties_the_structure(root):
+    FSUDict(root / "d", root / "tmp")["k"] = 1
+    FSList(root / "l", root / "tmp").append(1)
+    ns = FSNamespace(root / "ns")
+    ns.udict("a")["k"] = 1
+
+    # Default: data is kept.
+    assert FSUDict(root / "d", root / "tmp")["k"] == 1
+    assert FSList(root / "l", root / "tmp").values() == [1]
+    assert FSNamespace(root / "ns").names() == ["a"]
+
+    # clean=True: emptied before it is returned.
+    assert len(FSUDict(root / "d", root / "tmp", clean=True)) == 0
+    assert len(FSList(root / "l", root / "tmp", clean=True)) == 0
+    assert FSNamespace(root / "ns", clean=True).names() == []
+
+
+def test_namespace_methods_pass_clean_and_only_touch_their_variable(root):
+    ns = FSNamespace(root / "ns")
+    ns.udict("a")["k"] = 1
+    ns.list("l").append(1)
+    ns.namespace("s").udict("inner")["k"] = 1
+    ns.udict("keep")["k"] = 1
+
+    assert len(ns.udict("a", clean=True)) == 0
+    assert len(ns.list("l", clean=True)) == 0
+    assert ns.namespace("s", clean=True).names() == []
+    assert ns.keep["k"] == 1  # a sibling is not touched
+
+    ns.udict("a")["k"] = 2
+    assert len(ns.variable("a", clean=True)) == 0
+    assert ns.keep["k"] == 1
+    assert sorted(ns.names()) == ["a", "keep", "l", "s"]  # the variables still exist, empty
+
+
+def test_chained_namespaces_and_structures(root):
+    ns = FSNamespace(root / "ns")
+    ns.namespace("config").udict("user")["name"] = "Federico"
+    assert ns.config.user["name"] == "Federico"
+
+    ns.config.user["role"] = "admin"
+    ns.namespace("config").udict("user", clean=True)["name"] = "Ana"
+    assert sorted(ns.config.user.items()) == [("name", "Ana")]
+
+    ns.namespace("jobs", clean=True).list("queue").append("job-1")
+    assert ns.jobs.queue.values() == ["job-1"]
+
+
+def test_duplicated_name_raises_on_variable_and_attribute(root):
+    ns = FSNamespace(root / "ns")
+    ns.udict("dup")["k"] = 1
+    ns.udict("ok")["k"] = 2
+    (ns.base_path / "li_dup").mkdir()  # the same name as a list, made by hand
+
+    with pytest.raises(ValueError, match="several types"):
+        ns.variable("dup")
+    with pytest.raises(ValueError, match="several types"):
+        ns.dup
+
+    assert ns.type("dup") in ("ud", "li")  # unchanged: first entry found
+    assert ns.ok["k"] == 2
+    assert not hasattr(ns, "missing")
