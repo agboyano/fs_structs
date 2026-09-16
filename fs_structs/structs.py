@@ -435,6 +435,11 @@ json_serializer = JsonSerializer()
 #   extension and names that do not decode (Thumbs.db, desktop.ini, orphan temp files).
 # - _key_to_filename raises ValueError when the name exceeds 255 characters or, on Windows
 #   without LongPathsEnabled, when the full path exceeds 259 characters.
+# - __delitem__ is one unlink, atomic on local disks, SMB and NFS: a lost race between two
+#   deleters, or against a pop, shows up as KeyError; against a writer, the new value either
+#   survives or is deleted. On Linux a reader keeps its open file; on Windows an open file
+#   cannot be deleted (Python opens without FILE_SHARE_DELETE), so _retry repeats for about
+#   a second and then PermissionError propagates.
 # - clear() is shutil.rmtree + mkdir and is NOT concurrency-safe, by design (administrative
 #   operation): rmtree is file by file, so a failure leaves a partial state; a concurrent
 #   writer's rename into the removed directory raises FileNotFoundError (not retried); lock
@@ -660,6 +665,12 @@ class FSUDict:
 
     def __delitem__(self, key):
         """Remove ``key`` (``del d[key]``). Raises ``KeyError`` if it is missing.
+
+        Safe with other processes: the delete is one atomic file operation. If two
+        processes delete the same key, one succeeds and the other gets ``KeyError``. A value
+        written at the same moment either survives or is deleted, never half-written. On
+        Windows, a key that another process is reading at that instant cannot be deleted;
+        after the retries ``PermissionError`` is raised.
 
         See Also:
             FSUDict: Examples on the class.
@@ -1281,6 +1292,12 @@ class FSList:
 
     def __delitem__(self, index):
         """Remove the element at ``index`` (``del lst[index]``).
+
+        The element at ``index`` is chosen when the call starts, and that exact element is
+        deleted even if other processes append or pop meanwhile. ``KeyError`` if another
+        process removed it first, ``IndexError`` if the list is shorter than ``index``. No
+        lock is taken (the delete is atomic). In a shared queue use ``pop_left`` to consume;
+        ``del`` is for removing one specific element you have just looked at.
 
         See Also:
             FSList: Examples on the class.
