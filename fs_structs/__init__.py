@@ -22,7 +22,7 @@ Examples:
     3
 """
 
-__version__ = "0.0.3a0"
+__version__ = "0.0.4a0"
 
 from . import structs
 from . import watchdog

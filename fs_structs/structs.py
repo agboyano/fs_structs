@@ -48,6 +48,7 @@ import time
 import uuid
 from ast import literal_eval
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -66,6 +67,10 @@ MAX_WINDOWS_PATH_LEN = 259
 # Windows error codes that surface as OSError on network shares and are worth retrying:
 # 59 unexpected network error, 64 network name deleted, 121 semaphore timeout.
 _TRANSIENT_WINERRORS = {59, 64, 121}
+
+# Threads used by clear() to delete files. Every unlink on a network share is a round trip,
+# so deleting in parallel divides the time by roughly this number.
+CLEAR_THREADS = 16
 
 _SKIP = object()  # sentinel: "this file is not one of ours"
 
@@ -174,6 +179,43 @@ def _retry(fn, tries=5, wait=(0.05, 0.25)):
                 raise
             logger.debug("transient error, retry %d/%d: %s", attempt, tries, e)
             sleep(*wait)
+
+
+def _remove_contents(path, keep=()):
+    """Delete everything inside ``path``, but not ``path`` itself.
+
+    Sub-directories are emptied recursively and removed; the files of each directory are
+    unlinked in parallel with ``CLEAR_THREADS`` threads. Directories listed in ``keep`` are
+    left untouched. A file that disappears meanwhile is ignored; any other error is raised
+    after the remaining entries have been processed, as ``shutil.rmtree`` does.
+
+    Args:
+        path (str | Path): Directory to empty.
+        keep (collection of Path): Directories to leave alone, as resolved paths.
+
+    Raises:
+        OSError: The first error met, once every other entry has been tried.
+    """
+    entries = _retry(lambda: list(os.scandir(path)))
+    files = []
+    for entry in entries:
+        if Path(entry.path) in keep:
+            continue
+        if entry.is_dir(follow_symlinks=False):
+            _remove_contents(entry.path, keep)
+            _retry(lambda p=entry.path: os.rmdir(p))
+        else:
+            files.append(entry.path)
+
+    def unlink(p):
+        try:
+            _retry(lambda: os.unlink(p))
+        except FileNotFoundError:
+            pass  # deleted by someone else meanwhile
+
+    # pool.map raises the first error, but leaving the "with" block waits for every unlink.
+    with ThreadPoolExecutor(max_workers=CLEAR_THREADS) as pool:
+        list(pool.map(unlink, files))
 
 
 # ---------------------------------------------------------------------------
@@ -440,12 +482,14 @@ json_serializer = JsonSerializer()
 #   survives or is deleted. On Linux a reader keeps its open file; on Windows an open file
 #   cannot be deleted (Python opens without FILE_SHARE_DELETE), so _retry repeats for about
 #   a second and then PermissionError propagates.
-# - clear() is shutil.rmtree + mkdir and is NOT concurrency-safe, by design (administrative
-#   operation): rmtree is file by file, so a failure leaves a partial state; a concurrent
-#   writer's rename into the removed directory raises FileNotFoundError (not retried); lock
-#   directories inside are removed; on Windows a process that has a file open or a
-#   ReadDirectoryChangesW watch on the directory (a blocked pop_left) can make the rmtree
-#   or the mkdir fail. Readers only see KeyError. Per-file atomicity is never violated.
+# - clear() empties the directory in place with _remove_contents: the files are unlinked in
+#   parallel (CLEAR_THREADS threads, the win on a network share where every unlink is a
+#   round trip) and lock directories inside are removed. The directory itself is never
+#   removed, so a ReadDirectoryChangesW watch on it (a blocked pop_left) survives. It is NOT
+#   concurrency-safe, by design (administrative operation): a failure leaves a partial
+#   state; a value written at the same moment survives or is deleted; on Windows a file
+#   open in another process makes it raise PermissionError after the retries, once the
+#   other files are gone. Readers only see KeyError. Per-file atomicity is never violated.
 class FSUDict:
     """Unordered dict stored as one file per key in a directory.
 
@@ -771,13 +815,15 @@ class FSUDict:
     def clear(self):
         """Remove every key.
 
-        The whole directory is deleted and created again, so lock directories inside it
-        are deleted too.
+        The files are deleted in parallel (``CLEAR_THREADS`` threads, 16 by default), which
+        matters on a network share where every deletion is a round trip. Lock directories
+        inside the dict directory are deleted too.
 
         Not safe with other processes: call it only when no other process is using the
-        dict, for example when a job starts (see ``clean=True``). It is not atomic, and a
-        process writing at the same time can fail with ``FileNotFoundError``. The data of
-        other keys is never corrupted.
+        dict, for example when a job starts (see ``clean=True``). It is not atomic: a value
+        written at the same moment may survive or be deleted, and on Windows a key that
+        another process is reading at that instant makes it raise ``PermissionError`` after
+        the retries. The data of other keys is never corrupted.
 
         Examples:
             >>> import tempfile
@@ -789,8 +835,8 @@ class FSUDict:
             >>> len(d)
             0
         """
-        _retry(lambda: shutil.rmtree(self.base_path))
-        self.base_path.mkdir(parents=True, exist_ok=True)
+        self.base_path.mkdir(parents=True, exist_ok=True)  # in case it was removed by hand
+        _remove_contents(self.base_path)
         self.temp_dir.mkdir(parents=True, exist_ok=True)  # temp_dir may live inside base_path
 
     def update(self, iterable):
@@ -1308,8 +1354,7 @@ class FSList:
         """Remove every element.
 
         Not safe with other processes: stop producers and consumers first. Clearing a
-        queue while consumers run has no defined result; a consumer blocked in
-        ``pop_left`` may also fail, on Windows, when its directory is removed under it.
+        queue while consumers run has no defined result.
 
         Examples:
             >>> import tempfile
@@ -1726,10 +1771,7 @@ class FSNamespace:
             >>> ns.names()
             []
         """
-        for d in [d for d in self.base_path.iterdir() if d.is_dir() if d != self.temp_dir]:
-            _retry(lambda d=d: shutil.rmtree(d))
-        for f in [f for f in self.base_path.iterdir() if f.is_file()]:
-            _retry(f.unlink)
+        _remove_contents(self.base_path, keep={self.temp_dir})
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         if clear_tmp:
             self.clear_tmp()

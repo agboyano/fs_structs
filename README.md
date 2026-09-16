@@ -115,9 +115,11 @@ time with the local clock: keep clocks in sync and use minutes, not seconds.
   lists, not for large random-access sequences. `items()` returns `(value, key)` pairs and
   slice assignment appends surplus values instead of inserting them.
 - `clear()` (and `clean=True`) is an administrative operation: call it only when no other
-  process is using the structure, for example when a job starts. It is not atomic, it can
-  make a process that is writing at that moment fail, and `FSNamespace.clear()` also removes
-  temporary files in the shared `temp_dir`. Stored values are never corrupted.
+  process is using the structure, for example when a job starts. It is not atomic: a value
+  written at that moment may survive or be deleted, and `FSNamespace.clear()` also removes
+  temporary files in the shared `temp_dir`. Stored values are never corrupted. Files are
+  deleted in parallel (`fs_structs.structs.CLEAR_THREADS`, 16 threads by default), which
+  on a network share divides the time by roughly that number.
 - A namespace name must have one type. If `ud_name` and `li_name` both exist (a race between
   processes, or a directory made by hand), `ns.variable("name")` and `ns.name` raise
   `ValueError`; remove one of the directories.

@@ -73,6 +73,39 @@ def test_getitem_retries_transient_errors_but_not_missing_keys(root, monkeypatch
     assert calls["n"] == 1  # FileNotFoundError is not retried
 
 
+def test_clear_deletes_the_rest_and_raises_when_one_file_is_busy(root, monkeypatch, no_sleep):
+    d = FSUDict(root / "d", root / "tmp")
+    d.update({i: i for i in range(50)})
+    busy = d.base_path / d._key_to_filename(7)
+    original = os.unlink
+
+    def unlink(p, *a, **k):
+        if Path(p) == busy:
+            raise PermissionError(13, "The process cannot access the file")
+        return original(p, *a, **k)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    with pytest.raises(PermissionError):
+        d.clear()
+    assert d.keys() == [7]
+
+
+def test_clear_ignores_files_removed_meanwhile(root, monkeypatch, no_sleep):
+    d = FSUDict(root / "d", root / "tmp")
+    d.update({i: i for i in range(50)})
+    raced = d.base_path / d._key_to_filename(7)
+    original = os.unlink
+
+    def unlink(p, *a, **k):
+        original(p, *a, **k)
+        if Path(p) == raced:
+            raise FileNotFoundError(2, "No such file")  # another process got there first
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    d.clear()
+    assert len(d) == 0
+
+
 def test_transient_network_oserror_is_retried(no_sleep):
     calls = {"n": 0}
 

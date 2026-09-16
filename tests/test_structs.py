@@ -79,6 +79,24 @@ def test_udict_round_trips_keys_and_values(root, serializer):
     assert d.base_path.is_dir() and d.temp_dir.is_dir()
 
 
+@pytest.mark.parametrize("tmp_inside", [False, True], ids=["tmp_outside", "tmp_inside"])
+def test_udict_clear_empties_in_place(root, tmp_inside):
+    temp_dir = root / "d" / "tmp" if tmp_inside else root / "tmp"
+    d = FSUDict(root / "d", temp_dir)
+    d.update({i: i for i in range(200)})
+    acquire_lock(d.base_path, "l")
+    (d.base_path / "stray.txt").write_bytes(b"x")
+    (d.base_path / "other" / "deep").mkdir(parents=True)
+    (d.base_path / "other" / "deep" / "f").write_bytes(b"x")
+
+    d.clear()
+
+    assert len(d) == 0
+    assert d.base_path.is_dir() and d.temp_dir.is_dir()
+    left = [p.name for p in d.base_path.iterdir()]
+    assert left == (["tmp"] if tmp_inside else [])
+
+
 def test_udict_dict_as_key(root):
     d = FSUDict(root / "d", root / "tmp")
     key = {"adad": 1233, (1, 3, 4): [1, 2, 3, 4], 3: 1}
