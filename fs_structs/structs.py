@@ -49,7 +49,6 @@ import uuid
 from ast import literal_eval
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -182,205 +181,232 @@ def _retry(fn, tries=5, wait=(0.05, 0.25)):
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class FSSerializer:
-    """How values are written to and read from files.
+# Implementation notes:
+# - dump() opens the file, calls _write(), then flush + fsync so the bytes reach the disk
+#   (or the file server) before FSUDict renames the file onto its final name.
+# - A subclass sets `extension`, `binary` (True: "wb"/"rb"; False: text, UTF-8) and
+#   implements _write(value, f) and _read(f) on an open file object.
+# - FSUDict only needs three attributes from a serializer: dump, load and extension.
+class Serializer:
+    """How values are written to and read from files. Subclass it to add a format.
 
     Three serializers are ready to use: ``joblib_serializer`` (default, good for NumPy and
-    pandas objects), ``pickle_serializer`` and ``json_serializer``. You can build your own
-    for any other format.
-
-    Args:
-        dump (callable): ``dump(value, filename)`` writes ``value`` to the file.
-        load (callable): ``load(filename)`` reads the file and returns the value.
-        extension (str): File extension without the dot, for example ``"json"``.
+    pandas objects), ``pickle_serializer`` and ``json_serializer``. To store another format,
+    subclass ``Serializer``: set ``extension`` (file extension without the dot), set
+    ``binary`` (True for bytes, False for UTF-8 text) and write the two methods
+    ``_write(value, f)`` and ``_read(f)``, which receive an open file.
 
     See Also:
+        JoblibSerializer, PickleSerializer, JsonSerializer: The formats included.
         FSUDict: Receives a serializer in its ``serializer`` argument.
 
     Examples:
         A serializer that stores plain text:
 
         >>> import tempfile
-        >>> from fs_structs.structs import FSSerializer, FSUDict
-        >>> def dump_text(value, filename):
-        ...     with open(filename, "w", encoding="utf-8") as f:
+        >>> from fs_structs.structs import Serializer, FSUDict
+        >>> class TextSerializer(Serializer):
+        ...     extension = "txt"
+        ...     binary = False
+        ...     def _write(self, value, f):
         ...         f.write(value)
-        >>> def load_text(filename):
-        ...     with open(filename, "r", encoding="utf-8") as f:
+        ...     def _read(self, f):
         ...         return f.read()
-        >>> text_serializer = FSSerializer(dump_text, load_text, "txt")
         >>> root = tempfile.mkdtemp()
-        >>> notes = FSUDict(root + "/notes", root + "/tmp", serializer=text_serializer)
+        >>> notes = FSUDict(root + "/notes", root + "/tmp", serializer=TextSerializer())
         >>> notes["today"] = "call the bank"
         >>> notes["today"]
         'call the bank'
     """
 
-    dump: callable
-    load: callable
-    extension: str
+    extension = ""
+    binary = True
+
+    def dump(self, value, filename):
+        """Write ``value`` to ``filename`` and make sure it reaches the disk.
+
+        Args:
+            value: The object to store.
+            filename (str | Path): File to create or overwrite.
+
+        Examples:
+            >>> import tempfile
+            >>> from fs_structs.structs import json_serializer
+            >>> path = tempfile.mkdtemp() + "/value.json"
+            >>> json_serializer.dump({"a": 1}, path)
+            >>> json_serializer.load(path)
+            {'a': 1}
+        """
+        mode = "wb" if self.binary else "w"
+        kwargs = {} if self.binary else {"encoding": "utf-8"}
+        with open(filename, mode, **kwargs) as f:
+            self._write(value, f)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def load(self, filename):
+        """Read the value stored in ``filename``.
+
+        Args:
+            filename (str | Path): File to read.
+
+        Returns:
+            The stored object.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+
+        Examples:
+            >>> import tempfile
+            >>> from fs_structs.structs import pickle_serializer
+            >>> path = tempfile.mkdtemp() + "/value.pkl"
+            >>> pickle_serializer.dump((1, 2), path)
+            >>> pickle_serializer.load(path)
+            (1, 2)
+        """
+        mode = "rb" if self.binary else "r"
+        kwargs = {} if self.binary else {"encoding": "utf-8"}
+        with open(filename, mode, **kwargs) as f:
+            return self._read(f)
+
+    def _write(self, value, f):
+        """Write ``value`` to the open file ``f``. Implemented by each subclass."""
+        raise NotImplementedError
+
+    def _read(self, f):
+        """Read and return the value from the open file ``f``. Implemented by each subclass."""
+        raise NotImplementedError
 
 
-# Implementation notes:
-# - The file is flushed and fsync'ed so the data reaches the disk (or the network server)
-#   before the atomic rename done by FSUDict.
-def pickle_dump(value, filename):
-    """Write ``value`` to ``filename`` with ``pickle`` (highest protocol).
-
-    Args:
-        value: Any object that ``pickle`` can serialize.
-        filename (str | Path): File to create or overwrite.
-
-    See Also:
-        pickle_load: Reads the file back.
-        pickle_serializer: The ``FSSerializer`` that uses this pair of functions.
-
-    Examples:
-        >>> import tempfile
-        >>> from fs_structs.structs import pickle_dump, pickle_load
-        >>> path = tempfile.mkdtemp() + "/value.pkl"
-        >>> pickle_dump({"a": (1, 2)}, path)
-        >>> pickle_load(path)
-        {'a': (1, 2)}
-    """
-    with open(filename, "wb") as f:
-        pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
-        f.flush()
-        os.fsync(f.fileno())
-
-
-def pickle_load(filename):
-    """Read a value written by ``pickle_dump``.
-
-    Warning: ``pickle`` runs code while loading. Only read files from directories that you
-    trust.
-
-    Args:
-        filename (str | Path): File to read.
-
-    Returns:
-        The stored object.
-
-    Examples:
-        >>> import tempfile
-        >>> from fs_structs.structs import pickle_dump, pickle_load
-        >>> path = tempfile.mkdtemp() + "/value.pkl"
-        >>> pickle_dump([1, 2, 3], path)
-        >>> pickle_load(path)
-        [1, 2, 3]
-    """
-    with open(filename, "rb") as f:
-        return pickle.load(f)
-
-
-pickle_serializer = FSSerializer(pickle_dump, pickle_load, "pkl")
-"""FSSerializer: values stored with ``pickle``; extension ``pkl``."""
-
-
-def json_dump(value, filename):
-    """Write ``value`` to ``filename`` as UTF-8 JSON.
-
-    JSON keeps only str, int, float, bool, None, lists and dicts with string keys. Tuples
-    come back as lists and dict keys come back as strings.
-
-    Args:
-        value: A JSON-compatible object.
-        filename (str | Path): File to create or overwrite.
-
-    See Also:
-        json_load: Reads the file back.
-        json_serializer: The ``FSSerializer`` that uses this pair of functions.
-
-    Examples:
-        >>> import tempfile
-        >>> from fs_structs.structs import json_dump, json_load
-        >>> path = tempfile.mkdtemp() + "/value.json"
-        >>> json_dump({"city": "Málaga", "temp": (30, 31)}, path)
-        >>> json_load(path)
-        {'city': 'Málaga', 'temp': [30, 31]}
-    """
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(value, f)
-        f.flush()
-        os.fsync(f.fileno())
-
-
-def json_load(filename):
-    """Read a value written by ``json_dump`` (UTF-8 on every platform).
-
-    Args:
-        filename (str | Path): File to read.
-
-    Returns:
-        The stored object.
-
-    Examples:
-        >>> import tempfile
-        >>> from fs_structs.structs import json_dump, json_load
-        >>> path = tempfile.mkdtemp() + "/value.json"
-        >>> json_dump([1, "two"], path)
-        >>> json_load(path)
-        [1, 'two']
-    """
-    with open(filename, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-json_serializer = FSSerializer(json_dump, json_load, "json")
-"""FSSerializer: values stored as JSON text; extension ``json``."""
-
-
-def joblib_dump(value, filename):
-    """Write ``value`` to ``filename`` with ``joblib`` (efficient for NumPy and pandas).
-
-    Args:
-        value: Any object that ``joblib`` can serialize.
-        filename (str | Path): File to create or overwrite.
-
-    See Also:
-        joblib_load: Reads the file back.
-        joblib_serializer: The default ``FSSerializer``.
-
-    Examples:
-        >>> import tempfile
-        >>> from fs_structs.structs import joblib_dump, joblib_load
-        >>> path = tempfile.mkdtemp() + "/value.jbl"
-        >>> joblib_dump({"weights": [0.5, 0.5]}, path)
-        >>> joblib_load(path)
-        {'weights': [0.5, 0.5]}
-    """
-    with open(filename, "wb") as f:
-        joblib.dump(value, f)  # joblib.dump accepts a path or a file handle
-        f.flush()
-        os.fsync(f.fileno())
-
-
-def joblib_load(filename):
-    """Read a value written by ``joblib_dump``.
+class JoblibSerializer(Serializer):
+    """Values stored with ``joblib``, efficient for NumPy and pandas objects. Extension ``jbl``.
 
     Warning: like ``pickle``, ``joblib`` runs code while loading. Only read files from
     directories that you trust.
 
     Args:
-        filename (str | Path): File to read.
+        compress (int | bool | tuple): Compression passed to ``joblib.dump``. 0 (default)
+            means no compression; 3 is a good balance between size and speed.
 
-    Returns:
-        The stored object.
+    See Also:
+        Serializer: The interface and how to add a format.
+        joblib_serializer: The instance used by default.
 
     Examples:
         >>> import tempfile
-        >>> from fs_structs.structs import joblib_dump, joblib_load
-        >>> path = tempfile.mkdtemp() + "/value.jbl"
-        >>> joblib_dump(3.25, path)
-        >>> joblib_load(path)
-        3.25
+        >>> from fs_structs.structs import FSUDict, JoblibSerializer
+        >>> root = tempfile.mkdtemp()
+        >>> d = FSUDict(root + "/d", root + "/tmp", serializer=JoblibSerializer(compress=3))
+        >>> d["weights"] = [0.5, 0.5]
+        >>> d["weights"]
+        [0.5, 0.5]
     """
-    return joblib.load(filename)
+
+    extension = "jbl"
+
+    def __init__(self, compress=0):
+        self.compress = compress
+
+    def _write(self, value, f):
+        joblib.dump(value, f, compress=self.compress)
+
+    def _read(self, f):
+        return joblib.load(f)
 
 
-joblib_serializer = FSSerializer(joblib_dump, joblib_load, "jbl")
-"""FSSerializer: values stored with ``joblib``; extension ``jbl``. This is the default."""
+class PickleSerializer(Serializer):
+    """Values stored with ``pickle``. Extension ``pkl``.
+
+    Warning: ``pickle`` runs code while loading. Only read files from directories that you
+    trust.
+
+    Args:
+        protocol (int): Pickle protocol. Default ``pickle.HIGHEST_PROTOCOL``; use a lower
+            value to share files with older Python versions.
+
+    See Also:
+        Serializer: The interface and how to add a format.
+        pickle_serializer: The ready-made instance.
+
+    Examples:
+        >>> import tempfile
+        >>> from fs_structs.structs import FSUDict, PickleSerializer
+        >>> root = tempfile.mkdtemp()
+        >>> d = FSUDict(root + "/d", root + "/tmp", serializer=PickleSerializer(protocol=2))
+        >>> d["point"] = {"a": (1, 2)}
+        >>> d["point"]
+        {'a': (1, 2)}
+    """
+
+    extension = "pkl"
+
+    def __init__(self, protocol=pickle.HIGHEST_PROTOCOL):
+        self.protocol = protocol
+
+    def _write(self, value, f):
+        pickle.dump(value, f, protocol=self.protocol)
+
+    def _read(self, f):
+        return pickle.load(f)
+
+
+class JsonSerializer(Serializer):
+    """Values stored as UTF-8 JSON text. Extension ``json``. Safe to load from any directory.
+
+    JSON keeps only str, int, float, bool, None, lists and dicts with string keys. Tuples
+    come back as lists and dict keys come back as strings.
+
+    Args:
+        indent (int, optional): Spaces of indentation. None (default) writes one line.
+        ensure_ascii (bool): If True (default), non-ASCII characters are escaped, as
+            ``json.dump`` does; False writes them as UTF-8 text.
+
+    See Also:
+        Serializer: The interface and how to add a format.
+        json_serializer: The ready-made instance.
+
+    Examples:
+        >>> import tempfile
+        >>> from pathlib import Path
+        >>> from fs_structs.structs import FSUDict, JsonSerializer, json_serializer
+        >>> root = tempfile.mkdtemp()
+        >>> d = FSUDict(root + "/d", root + "/tmp", serializer=json_serializer)
+        >>> d["city"] = {"name": "Málaga", "temp": (30, 31)}
+        >>> d["city"]
+        {'name': 'Málaga', 'temp': [30, 31]}
+
+        With ``indent`` the file is easy to read in a text editor:
+
+        >>> pretty = JsonSerializer(indent=2)
+        >>> pretty.dump({"name": "Malaga"}, root + "/city.json")
+        >>> print(Path(root + "/city.json").read_text(encoding="utf-8"))
+        {
+          "name": "Malaga"
+        }
+    """
+
+    extension = "json"
+    binary = False
+
+    def __init__(self, indent=None, ensure_ascii=True):
+        self.indent = indent
+        self.ensure_ascii = ensure_ascii
+
+    def _write(self, value, f):
+        json.dump(value, f, indent=self.indent, ensure_ascii=self.ensure_ascii)
+
+    def _read(self, f):
+        return json.load(f)
+
+
+joblib_serializer = JoblibSerializer()
+"""JoblibSerializer: the default serializer of ``FSUDict``, ``FSList`` and ``FSNamespace``."""
+
+pickle_serializer = PickleSerializer()
+"""PickleSerializer with the highest pickle protocol."""
+
+json_serializer = JsonSerializer()
+"""JsonSerializer with the ``json.dump`` defaults: one line, non-ASCII escaped."""
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +458,7 @@ class FSUDict:
     Args:
         base_path (str | Path): Directory where the values are stored. Created if missing.
         temp_dir (str | Path): Directory for temporary files. Same volume as ``base_path``.
-        serializer (FSSerializer): How values are written and read. Default: joblib.
+        serializer (Serializer): How values are written and read. Default: joblib.
         fast (bool): If True, values are written directly, without atomic operations.
             Faster, but not safe for distributed processes: a reader may see a partial
             file. Default False.
@@ -450,7 +476,7 @@ class FSUDict:
     See Also:
         FSList: A list (and FIFO queue) built on top of this class.
         FSNamespace: Creates dicts and lists by name under one directory.
-        FSSerializer: To store values in another format.
+        Serializer: To store values in another format (subclass it).
 
     Examples:
         >>> import tempfile
@@ -1037,7 +1063,7 @@ class FSList:
     Args:
         base_path (str | Path): Directory where the elements are stored. Created if missing.
         temp_dir (str | Path): Directory for temporary files. Same volume as ``base_path``.
-        serializer (FSSerializer): How elements are written and read. Default: joblib.
+        serializer (Serializer): How elements are written and read. Default: joblib.
         fast (bool): If True, elements are written without atomic operations and
             ``pop_left`` takes no lock. Faster, but not safe for distributed processes.
             Default False.
@@ -1472,7 +1498,7 @@ class FSNamespace:
         base_path (str | Path): Root directory of the namespace. Created if missing.
         temp_dir (str | Path, optional): Directory for temporary files. Default
             ``base_path/tmp``. Must be on the same volume as ``base_path``.
-        serializer (FSSerializer): Serializer for every variable. Default: joblib.
+        serializer (Serializer): Serializer for every variable. Default: joblib.
         clean (bool): If True, every variable and sub-namespace is removed (``clear()``)
             before the namespace is returned. Default False. ``clean=True`` is not atomic
             (see ``clear()``).

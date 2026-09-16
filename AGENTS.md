@@ -11,7 +11,9 @@ with each other. The library works on Windows and Linux machines.
 - `fs_structs/structs.py`: `FSUDict` (unordered dict, one file per key), `FSList` (list that
   can be used as a FIFO queue), `FSNamespace` (directory of named dicts, lists and
   sub-namespaces), directory locks (`acquire_lock`, `release_lock`, `lock_context`) and the
-  serializers (`joblib`, `pickle`, `json`).
+  serializers: the `Serializer` base class, `JoblibSerializer`, `PickleSerializer`,
+  `JsonSerializer` and their default instances `joblib_serializer`, `pickle_serializer`,
+  `json_serializer`. A custom format is a subclass of `Serializer`.
 - `fs_structs/watchdog.py`: waiting for filesystem events with the `watchdog` package,
   with polling on Linux network mounts.
 - `tests/`: pytest suite. `conftest.py` provides the `root` fixture (a fresh directory,

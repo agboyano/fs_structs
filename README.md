@@ -122,7 +122,10 @@ time with the local clock: keep clocks in sync and use minutes, not seconds.
   processes, or a directory made by hand), `ns.variable("name")` and `ns.name` raise
   `ValueError`; remove one of the directories.
 - `pickle` and `joblib` (the default) execute code when loading. Do not use them on a
-  directory writable by untrusted parties; `json_serializer` is available.
+  directory writable by untrusted parties; `json_serializer` is available. The three
+  serializers accept parameters (`JsonSerializer(indent=2)`, `JoblibSerializer(compress=3)`,
+  `PickleSerializer(protocol=2)`); another format is a subclass of `Serializer` with two
+  methods (see `help(fs_structs.structs.Serializer)`).
 - Directories synchronised with a delay between hosts (OneDrive, Dropbox and the like) are
   **not supported**: neither rename nor mkdir is atomic across hosts there.
 

@@ -13,7 +13,11 @@ from fs_structs.structs import (
     FSList,
     FSNamespace,
     FSUDict,
+    JoblibSerializer,
+    JsonSerializer,
     LockingError,
+    PickleSerializer,
+    Serializer,
     acquire_lock,
     joblib_serializer,
     json_serializer,
@@ -427,3 +431,50 @@ def test_duplicated_name_raises_on_variable_and_attribute(root):
     assert ns.type("dup") in ("ud", "li")  # unchanged: first entry found
     assert ns.ok["k"] == 2
     assert not hasattr(ns, "missing")
+
+
+# --------------------------------------------------------------------------- serializers
+
+
+def test_custom_serializer_subclass(root):
+    class TextSerializer(Serializer):
+        extension = "txt"
+        binary = False
+
+        def _write(self, value, f):
+            f.write(value)
+
+        def _read(self, f):
+            return f.read()
+
+    d = FSUDict(root / "d", root / "tmp", serializer=TextSerializer())
+    d["k"] = "añá €"
+    assert d["k"] == "añá €"
+    assert [p.suffix for p in d.base_path.iterdir()] == [".txt"]
+
+
+def test_serializer_parameters(root):
+    pretty = JsonSerializer(indent=2, ensure_ascii=False)
+    pretty.dump({"name": "Málaga"}, root / "v.json")
+    text = (root / "v.json").read_text(encoding="utf-8")
+    assert "\n" in text and "Málaga" in text
+    assert pretty.load(root / "v.json") == {"name": "Málaga"}
+
+    for serializer in (JoblibSerializer(compress=3), PickleSerializer(protocol=2), JsonSerializer()):
+        d = FSUDict(root / serializer.extension, root / "tmp", serializer=serializer)
+        d["k"] = {"a": [1, 2]}
+        assert d["k"] == {"a": [1, 2]}
+
+
+def test_default_serializers_keep_the_old_file_format(root):
+    """Byte compatibility with files written by the previous function-based serializers."""
+    import json
+    import pickle
+
+    json_serializer.dump({"city": "Málaga"}, root / "v.json")
+    assert (root / "v.json").read_bytes() == json.dumps({"city": "Málaga"}).encode("utf-8")
+
+    pickle_serializer.dump((1, 2), root / "v.pkl")
+    assert (root / "v.pkl").read_bytes() == pickle.dumps((1, 2), protocol=pickle.HIGHEST_PROTOCOL)
+
+    assert (joblib_serializer.extension, pickle_serializer.extension, json_serializer.extension) == ("jbl", "pkl", "json")
