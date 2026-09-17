@@ -9,6 +9,7 @@ with each other. The library works on Windows and Linux machines.
 - ``fs_structs.structs.FSNamespace``: a directory of named dicts, lists and sub-namespaces.
 - ``fs_structs.structs.lock_context``: one process at a time, on any machine.
 - ``fs_structs.watchdog.wait_until``: wait for a change in a directory.
+- ``fs_structs.fslist_simple.FSListSimple``: the previous ``FSList``, on top of ``FSUDict``.
 
 Every public class and function has runnable examples in its docstring
 (``help(fs_structs.structs.FSUDict)``). README.md lists the guarantees and the limits.
@@ -22,10 +23,11 @@ Examples:
     3
 """
 
-__version__ = "0.0.4a0"
+__version__ = "0.0.5a0"
 
 from . import structs
 from . import watchdog
+from . import fslist_simple
 
 import logging
 logging.getLogger(__name__).addHandler(logging.NullHandler())

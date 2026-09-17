@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fs_structs"
-version = "0.0.4a0"
+version = "0.0.5a0"
 description = "Dict, list and namespace data structures stored on a shared directory (local disk, SMB or NFS)."
 readme = "README.md"
 requires-python = ">=3.9"

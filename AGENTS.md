@@ -14,6 +14,9 @@ with each other. The library works on Windows and Linux machines.
   serializers: the `Serializer` base class, `JoblibSerializer`, `PickleSerializer`,
   `JsonSerializer` and their default instances `joblib_serializer`, `pickle_serializer`,
   `json_serializer`. A custom format is a subclass of `Serializer`.
+- `fs_structs/fslist_simple.py`: `FSListSimple`, the `FSList` of versions before 0.0.5, built
+  on `FSUDict`. Same behaviour as `FSList`, different file names. Keep the two in sync when
+  the list API changes; the tests run the list suite on both.
 - `fs_structs/watchdog.py`: waiting for filesystem events with the `watchdog` package,
   with polling on Linux network mounts.
 - `tests/`: pytest suite. `conftest.py` provides the `root` fixture (a fresh directory,
@@ -29,8 +32,11 @@ README.md documents the guarantees, requirements and limitations. Read it first.
   `os.replace`. Readers never see a partial file. `temp_dir` must stay on the same volume.
 - **Exclusive locks**: `os.mkdir` of the `.lock` directory is the lock. It works on local
   disks, SMB/Samba and NFS. The `owner` file inside is informative and used by `max_age`.
-- **Exactly-once `pop_left`**: consumers on any machine take the lock inside the list
-  directory; `FSUDict.pop` renames the file away before reading it.
+- **Exactly-once `pop_left`**: `_take_file` renames the element's file into `temp_dir`,
+  reads it and deletes it (`FSList._take`, `FSUDict.pop`). A rename alone is NOT a claim on
+  Windows or SMB (two renames of one file can both succeed, see the notes of `_take_file`):
+  the caller whose copy is missing when it opens or deletes it gives the value up. Keep
+  those two checks. No lock is involved; `FSListSimple` takes a directory lock in addition.
 - **Compatibility**: the public API is used by other projects (positional arguments). New
   parameters go last, with a default that keeps the current behaviour. Do not rename or
   remove public names, and do not change the file-name scheme (`hex(repr(key)) + "." + ext`)

@@ -8,7 +8,8 @@ The module has three structures and one lock:
 
 - ``FSUDict``: an unordered dict. Every key is a file in a directory.
 - ``FSList``: a list stored in a directory. It can be used as a FIFO queue shared by
-  several processes: producers ``append``, consumers ``pop_left``.
+  several processes: producers ``append``, consumers ``pop_left``. The previous
+  implementation, on top of ``FSUDict``, is ``fs_structs.fslist_simple.FSListSimple``.
 - ``FSNamespace``: a directory that holds named dicts, lists and sub-namespaces.
 - ``lock_context`` (with ``acquire_lock`` and ``release_lock``): a lock that lets only one
   process at a time, on any machine, run a piece of code.
@@ -42,6 +43,7 @@ import logging
 import os
 import pickle
 import random
+import re
 import shutil
 import socket
 import time
@@ -216,6 +218,83 @@ def _remove_contents(path, keep=()):
     # pool.map raises the first error, but leaving the "with" block waits for every unlink.
     with ThreadPoolExecutor(max_workers=CLEAR_THREADS) as pool:
         list(pool.map(unlink, files))
+
+
+def _replace(src, dst):
+    """Rename ``src`` onto ``dst`` with retries. Used by ``FSUDict`` and ``FSList``.
+
+    Args:
+        src (Path): Existing file.
+        dst (Path): Final name; overwritten if it exists.
+
+    Raises:
+        ValueError: If ``src`` and ``dst`` are on different volumes.
+        OSError: Any other error, after the retries (``FileNotFoundError`` at once).
+    """
+    try:
+        try:
+            _retry(lambda: src.replace(dst))
+        except PermissionError:
+            # Windows: the target is still open elsewhere after the retries.
+            # Not atomic, but the best available: remove and rename.
+            dst.unlink(missing_ok=True)
+            src.replace(dst)
+    except OSError as e:
+        if _is_cross_device(e):
+            raise ValueError(
+                f"temp_dir ({src.parent}) must be on the same volume as base_path "
+                f"({dst.parent}): an atomic rename across volumes is impossible"
+            ) from e
+        raise
+
+
+# Implementation notes:
+# - On POSIX rename(2) is atomic on the path: of several processes renaming the same file,
+#   one succeeds and the others get ENOENT. On Windows, and on SMB shares, MoveFileEx and
+#   the SMB2 rename open a handle and rename through it: two processes that open the file
+#   before either rename completes BOTH succeed, and the second rename moves the file a
+#   second time, out of the first caller's temp path (measured on NTFS: 499 of 500 tight
+#   races). The rename alone is therefore not a claim.
+# - What is safe: while a Python file object is open nobody can rename or delete the file
+#   (no FILE_SHARE_DELETE), and a deleted file cannot be renamed. So the caller whose temp
+#   file is missing when it opens it, or when it deletes it after reading, has lost the
+#   race and gives the value up; the last renamer is the one that keeps it. Every other
+#   error keeps the value for us (a delete that still fails after the retries is logged).
+# - FSUDict.pop and FSList._take use it; FSListSimple.pop_left adds a lock on top.
+def _take_file(src, temp, load):
+    """Move ``src`` to ``temp``, read it with ``load`` and delete it. One caller only keeps it.
+
+    Args:
+        src (Path): The file to take.
+        temp (Path): A new, unique path in the temp directory.
+        load (callable): ``load(path)`` returns the stored value.
+
+    Returns:
+        The value.
+
+    Raises:
+        FileNotFoundError: If another caller took the file, before or after our rename.
+        ValueError: If ``temp`` is on another volume than ``src``.
+        OSError: Other errors of the rename or the read, after the retries.
+    """
+    _replace(src, temp)
+    try:
+        value = _retry(lambda: load(temp))
+    except BaseException:
+        # FileNotFoundError: a late rename moved the file away, we lost it. Any other error:
+        # the value is unreadable; remove the file, as FSUDict.pop always did.
+        try:
+            temp.unlink()
+        except OSError as e:
+            logger.debug("could not remove temp file %s: %s", temp, e)
+        raise
+    try:
+        _retry(temp.unlink)
+    except FileNotFoundError:
+        raise  # moved away between our read and our delete: the other caller keeps it
+    except OSError as e:
+        logger.warning("could not remove %s after reading it: %s", temp, e)
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -479,8 +558,8 @@ json_serializer = JsonSerializer()
 #   including the multi-process queue tests, passes with FS_STRUCTS_TEST_ROOT on the share.
 #   SMB clients raise transient OSErrors under load (WinError 59, 64, 121): _retry covers
 #   them.
-# - pop (fast=False): the file is first renamed into temp_dir, then loaded. Only one of
-#   several concurrent callers can win the rename, so a key is handed to one caller only.
+# - pop (fast=False) uses _take_file: rename into temp_dir, read, delete. See its notes for
+#   why the rename alone is not a claim on Windows and how exactly one caller keeps the value.
 # - Every file operation goes through _retry: PermissionError (Windows, file open in
 #   another process) and transient network errors are repeated a few times.
 # - keys() ignores directories (locks live inside the data directory), files with another
@@ -534,7 +613,7 @@ class FSUDict:
         KeyError: When reading, deleting or popping a key that does not exist.
 
     See Also:
-        FSList: A list (and FIFO queue) built on top of this class.
+        FSList: A list (and FIFO queue) that uses the same file techniques.
         FSNamespace: Creates dicts and lists by name under one directory.
         Serializer: To store values in another format (subclass it).
 
@@ -665,21 +744,7 @@ class FSUDict:
             ValueError: If ``src`` and ``dst`` are on different volumes.
             OSError: Any other error, after the retries.
         """
-        try:
-            try:
-                _retry(lambda: src.replace(dst))
-            except PermissionError:
-                # Windows: the target is still open elsewhere after the retries.
-                # Not atomic, but the best available: remove and rename.
-                dst.unlink(missing_ok=True)
-                src.replace(dst)
-        except OSError as e:
-            if _is_cross_device(e):
-                raise ValueError(
-                    f"temp_dir ({src.parent}) must be on the same volume as base_path "
-                    f"({dst.parent}): an atomic rename across volumes is impossible"
-                ) from e
-            raise
+        _replace(src, dst)
 
     # -- mapping protocol -----------------------------------------------------------
 
@@ -902,8 +967,8 @@ class FSUDict:
         """Remove ``key`` and return its value.
 
         When several processes call ``pop`` on the same key at the same time, only one of
-        them gets the value; the others get ``KeyError``. This is what makes ``FSList``
-        a safe queue.
+        them gets the value; the others get ``KeyError``. ``FSList.pop_left`` uses the same
+        rename-before-read technique to be a safe queue.
 
         Args:
             key: The key to remove.
@@ -931,18 +996,10 @@ class FSUDict:
             del self[key]
             return value
 
-        temp_path = self._temp_path()
         try:
-            self._replace(target_path, temp_path)
+            return _take_file(target_path, self._temp_path(), self.load)
         except FileNotFoundError:
             raise KeyError(key) from None
-        try:
-            return _retry(lambda: self.load(temp_path))
-        finally:
-            try:
-                temp_path.unlink()
-            except OSError as e:
-                logger.debug("could not remove temp file %s: %s", temp_path, e)
 
 
 # ---------------------------------------------------------------------------
@@ -1105,12 +1162,66 @@ class TimeOrderedTuple:
         return tuple(new_tuple)
 
 
+_KEY_OFFSET = 1 << 63  # added to every component so that negative keys sort first
+_KEY_WIDTH = 16  # hex digits of one component: any value in [-2**63, 2**63) fits
+
+
+def _encode_key(key):
+    """Return the file stem of an ``FSList`` key: fixed-width offset hex, one part per component.
+
+    The string order of two stems is the tuple order of their keys, so a directory listing
+    can be sorted without decoding any name.
+
+    Args:
+        key (tuple): Tuple of ints from ``TimeOrderedTuple``.
+
+    Returns:
+        str: For example ``(1, -1)`` -> ``"8000000000000001_7fffffffffffffff"``.
+
+    Raises:
+        ValueError: If a component is outside ``[-2**63, 2**63)``.
+    """
+    parts = []
+    for c in key:
+        n = c + _KEY_OFFSET
+        if not 0 <= n < (1 << 64):
+            raise ValueError(f"FSList key component out of range: {c}")
+        parts.append(format(n, f"0{_KEY_WIDTH}x"))
+    return "_".join(parts)
+
+
+def _decode_key(stem):
+    """Return the key encoded by ``_encode_key`` in ``stem`` (file name without extension)."""
+    return tuple(int(part, 16) - _KEY_OFFSET for part in stem.split("_"))
+
+
 # Implementation notes:
-# - Storage is an FSUDict whose keys come from TimeOrderedTuple; keys() sorts them, so
-#   every indexed access costs a directory listing plus a sort (O(n log n)).
-# - pop_left (fast=False) takes the directory lock "pop_left_lock" inside the list
-#   directory, so consumers on different hosts never take the same element. Producers do
-#   not lock: the atomic rename of FSUDict.__setitem__ is enough.
+# - One file per element in base_path, named _encode_key(key) + "." + ext, key from
+#   TimeOrderedTuple. Every component is 16 hex digits with an offset of 2**63, parts are
+#   joined with "_". Fixed width makes the string order equal to the numeric order; the
+#   offset puts negative front keys first; "_" (0x5F) sorts after "." (0x2E), so a shorter
+#   tuple sorts before a longer one with the same prefix, as tuples do. sorted(names) is
+#   therefore the list order, pop_left never decodes a name, and keys() decodes with int()
+#   instead of ast.literal_eval. Names that do not match the pattern (lock directories,
+#   Thumbs.db, other extensions) are ignored, like FSUDict does.
+# - FSListSimple (fs_structs.fslist_simple) is the previous implementation on top of
+#   FSUDict. Same behaviour and outputs, different file names: the two classes do not see
+#   each other's elements.
+# - Writes (fast=False): dump to temp_dir/tmp_<uuid> with fsync, then _replace onto the
+#   final name (atomic, same guarantees as FSUDict.__setitem__). The temp file is removed
+#   only when the write fails: after a successful rename it no longer exists, and checking
+#   would cost a round trip on a network share. append() does not check that the key is
+#   new: keys are monotonic inside a process plus a random component.
+# - pop_left is lock-free: sorted(names), then _take(name), which is _take_file: rename the
+#   file into temp_dir, read it, delete it. On Windows two renames of the same file can
+#   both succeed, so the consumer whose copy is missing when it opens or deletes it gives
+#   the element up (see the notes of _take_file): exactly one consumer keeps each element,
+#   on any host. A consumer that loses sleeps `wait` and tries the next name; if every listed name was
+#   taken meanwhile it lists again; an empty listing raises IndexError. timeout,
+#   watchdog_timeout and max_age are accepted for compatibility with FSListSimple and
+#   ignored: there is no lock to wait for and LockingError is never raised. FIFO per
+#   producer holds: a consumer always takes the first available element and new rear keys
+#   sort after everything already listed.
 # - Order between hosts depends on their clocks: FIFO is exact inside one process and
 #   approximate across machines.
 # - Differences from list: items() returns (value, key) pairs; slice assignment with more
@@ -1123,25 +1234,33 @@ class FSList:
     iteration work like in a Python list, but every access reads the directory, so it is
     made for queues and small lists, not for big random-access sequences.
 
-    As a **FIFO queue**: producers call ``append`` and consumers call ``pop_left``.
-    ``pop_left`` uses a lock, so each element is given to exactly one consumer even when
-    the consumers run on different machines. Elements appended by different machines are
-    ordered by each machine's clock, so the order between machines is approximate.
+    As a **FIFO queue**: producers call ``append`` and consumers call ``pop_left``. Each
+    element is given to exactly one consumer even when the consumers run on different
+    machines, without any lock: the consumer renames the file before reading it, and only
+    one rename can succeed. Elements appended by different machines are ordered by each
+    machine's clock, so the order between machines is approximate.
+
+    ``fs_structs.fslist_simple.FSListSimple`` is the previous implementation, built on
+    ``FSUDict``. It behaves the same but names its files differently, so the two classes
+    do not see each other's elements.
 
     Args:
         base_path (str | Path): Directory where the elements are stored. Created if missing.
         temp_dir (str | Path): Directory for temporary files. Same volume as ``base_path``.
         serializer (Serializer): How elements are written and read. Default: joblib.
         fast (bool): If True, elements are written without the atomic rename and without
-            fsync, and ``pop_left`` takes no lock. Much faster, but not safe for
+            fsync, and ``pop_left`` reads before deleting. Much faster, but not safe for
             distributed processes nor against a crash. Default False.
         clean (bool): If True, the list is emptied (``clear()``) before it is returned.
             Default False. ``clean=True`` is not atomic (see ``clear()``).
 
+    Raises:
+        ValueError: If ``temp_dir`` is on another volume than ``base_path``.
+
     See Also:
-        FSUDict: The storage under the list.
         FSNamespace: Creates lists by name under one directory.
         TimeOrderedTuple: Generates the keys that keep the order.
+        fs_structs.fslist_simple.FSListSimple: The previous implementation.
 
     Examples:
         As a list:
@@ -1183,24 +1302,95 @@ class FSList:
     """
 
     def __init__(self, base_path, temp_dir, serializer=joblib_serializer, fast=False, clean=False):
-        self.data = FSUDict(base_path, temp_dir, serializer, fast=fast, clean=clean)
-        self.base_path = self.data.base_path
+        self.base_path = Path(base_path).resolve()
+        self.temp_dir = Path(temp_dir).resolve()
+
+        self.base_path.mkdir(parents=True, exist_ok=True)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+
         self.serializer = serializer
+        self.ext = serializer.extension
+        self._name_re = re.compile(
+            rf"^[0-9a-f]{{{_KEY_WIDTH}}}(_[0-9a-f]{{{_KEY_WIDTH}}})*\.{re.escape(self.ext)}$"
+        )
         self.key_generator = TimeOrderedTuple()
-        self.id = uuid.uuid4().hex  # v7 is time ordered, not implemented yet
+        self.id = uuid.uuid4().hex
         self.fast = fast
 
-    def _append_key(self):
-        """Return a new key that sorts after every existing key."""
-        return self.key_generator.new_rear_tuple()
+        if clean:
+            self.clear()
 
-    def _new_zero_key(self):
-        """Return a new key that sorts before every existing key."""
-        return self.key_generator.new_front_tuple()
+    # -- files ------------------------------------------------------------------
 
-    def _new_mid_key(self, prev_key, next_key):
-        """Return a new key that sorts between ``prev_key`` and ``next_key``."""
-        return self.key_generator.new_mid_tuple(prev_key, next_key)
+    def _names(self):
+        """Return the file names of the elements, unsorted. Other files and directories are ignored."""
+        entries = _retry(lambda: list(os.scandir(self.base_path)))
+        return [e.name for e in entries if self._name_re.match(e.name) and e.is_file()]
+
+    def _sorted_names(self):
+        """Return the file names of the elements in list order (string order = key order)."""
+        return sorted(self._names())
+
+    def _name(self, key):
+        """Return the file name for ``key``."""
+        return _encode_key(key) + "." + self.ext
+
+    @staticmethod
+    def _key_of(name):
+        """Return the key stored under file ``name``."""
+        return _decode_key(name.rsplit(".", 1)[0])
+
+    def _temp_path(self):
+        """Return a new unique path in ``temp_dir``."""
+        return self.temp_dir / f"tmp_{uuid.uuid4().hex}"
+
+    def _write(self, key, value):
+        """Store ``value`` under ``key``: direct dump in fast mode, temp file + rename otherwise."""
+        target = self.base_path / self._name(key)
+        if self.fast:
+            _retry(lambda: self.serializer.dump(value, target, fsync=False))
+            return
+        temp = self._temp_path()
+        try:
+            self.serializer.dump(value, temp)
+            _replace(temp, target)
+        except BaseException:
+            try:
+                temp.unlink()
+            except OSError as e:
+                logger.debug("could not remove temp file %s: %s", temp, e)
+            raise
+
+    def _load(self, name):
+        """Return the value stored in file ``name``. ``KeyError`` if it is gone."""
+        try:
+            return _retry(lambda: self.serializer.load(self.base_path / name))
+        except FileNotFoundError:
+            raise KeyError(self._key_of(name)) from None
+
+    def _take(self, name):
+        """Remove file ``name`` and return its value. ``KeyError`` if another process took it.
+
+        Without ``fast`` the file is renamed into ``temp_dir``, read and deleted
+        (``_take_file``), so only one of several concurrent callers keeps the value.
+        """
+        if self.fast:
+            value = self._load(name)
+            self._delete(name)
+            return value
+        try:
+            return _take_file(self.base_path / name, self._temp_path(), self.serializer.load)
+        except FileNotFoundError:
+            raise KeyError(self._key_of(name)) from None
+
+    def _delete(self, name):
+        """Remove file ``name``. ``KeyError`` if it is already gone."""
+        try:
+            _retry((self.base_path / name).unlink)
+        except FileNotFoundError:
+            raise KeyError(self._key_of(name)) from None
+
+    # -- list API -------------------------------------------------------------
 
     def append(self, value):
         """Add ``value`` at the end of the list.
@@ -1218,9 +1408,7 @@ class FSList:
             >>> lst.values()
             [10, 20]
         """
-        new_key = self._append_key()
-        assert new_key not in self.data
-        self.data[new_key] = value
+        self._write(self.key_generator.new_rear_tuple(), value)
 
     def extend(self, iterable):
         """Add every element of ``iterable`` at the end, in order.
@@ -1287,11 +1475,11 @@ class FSList:
             if N == 0:
                 self.append(value)
             else:
-                self.data[self._new_zero_key()] = value
+                self._write(self.key_generator.new_front_tuple(), value)
         elif index >= N:
             self.append(value)
         elif 0 < index < N:
-            self.data[self._new_mid_key(keys[index - 1], keys[index])] = value
+            self._write(self.key_generator.new_mid_tuple(keys[index - 1], keys[index]), value)
         else:
             raise IndexError("list assignment index out of range")
 
@@ -1310,7 +1498,7 @@ class FSList:
             >>> lst.values()
             ['x', 'y']
         """
-        return [self.data[k] for k in self.keys()]
+        return [self._load(n) for n in self._sorted_names()]
 
     def items(self):
         """Return ``(value, key)`` pairs in order. Note the order: value first, then key.
@@ -1327,7 +1515,7 @@ class FSList:
             >>> [value for value, key in lst.items()]
             ['x', 'y']
         """
-        return [(self.data[k], k) for k in self.keys()]
+        return [(self._load(n), self._key_of(n)) for n in self._sorted_names()]
 
     def keys(self):
         """Return the internal keys, sorted. They define the order of the elements.
@@ -1345,7 +1533,7 @@ class FSList:
             >>> len(keys) == 2 and keys[0] < keys[1]
             True
         """
-        return sorted(self.data.keys())
+        return [self._key_of(n) for n in self._sorted_names()]
 
     def __delitem__(self, index):
         """Remove the element at ``index`` (``del lst[index]``).
@@ -1359,7 +1547,7 @@ class FSList:
         See Also:
             FSList: Examples on the class.
         """
-        del self.data[self.keys()[index]]
+        self._delete(self._sorted_names()[index])
 
     def clear(self):
         """Remove every element.
@@ -1377,7 +1565,9 @@ class FSList:
             >>> len(lst)
             0
         """
-        self.data.clear()
+        self.base_path.mkdir(parents=True, exist_ok=True)  # in case it was removed by hand
+        _remove_contents(self.base_path)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)  # temp_dir may live inside base_path
 
     def __getitem__(self, index):
         """Return one element (``lst[i]``) or a list of elements (``lst[a:b]``).
@@ -1385,9 +1575,10 @@ class FSList:
         See Also:
             FSList: Examples on the class.
         """
+        names = self._sorted_names()
         if isinstance(index, slice):
-            return [self.data[k] for k in self.keys()[index]]
-        return self.data[self.keys()[index]]
+            return [self._load(n) for n in names[index]]
+        return self._load(names[index])
 
     def __setitem__(self, index, value):
         """Replace one element (``lst[i] = v``) or a slice (``lst[a:b] = values``).
@@ -1398,9 +1589,9 @@ class FSList:
         See Also:
             FSList: Examples on the class.
         """
+        names = self._sorted_names()
         if isinstance(index, slice):
-            ks = self.keys()
-            li = [x for x in range(len(ks))[index]]
+            li = [x for x in range(len(names))[index]]
             step = 1 if index.step is None else index.step
             if (len(li) != len(value)) and step != 1:
                 raise ValueError(
@@ -1409,17 +1600,14 @@ class FSList:
 
             i = 0
             for j in li:
-                self.data[ks[j]] = value[i]
+                self._write(self._key_of(names[j]), value[i])
                 i += 1
 
             if i < (len(value)):
                 for j in range(i, len(value)):
                     self.append(value[j])
         else:
-            self.data[self.keys()[index]] = value
-
-    def __del__(self):
-        pass
+            self._write(self._key_of(names[index]), value)
 
     def __contains__(self, key):
         """Return True if some element equals ``key`` (``value in lst``). Reads every element.
@@ -1435,7 +1623,7 @@ class FSList:
         See Also:
             FSList: Examples on the class.
         """
-        return (self.data[k] for k in self.keys())
+        return (self._load(n) for n in self._sorted_names())
 
     def __len__(self):
         """Return the number of elements (``len(lst)``).
@@ -1443,13 +1631,13 @@ class FSList:
         See Also:
             FSList: Examples on the class.
         """
-        return len(self.keys())
+        return len(self._names())
 
     def pop(self, index=-1):
         """Remove and return the element at ``index`` (the last one by default).
 
-        This method does not take a lock. Use it when only one process removes elements
-        from the list; with several consumers use ``pop_left``.
+        Use it when only one process removes elements from the list; with several
+        consumers use ``pop_left``.
 
         Args:
             index (int): Position; negative values count from the end. Default -1.
@@ -1459,6 +1647,7 @@ class FSList:
 
         Raises:
             IndexError: If the list is empty or ``index`` is out of range.
+            KeyError: If another process removed that element first.
 
         Examples:
             >>> import tempfile
@@ -1473,35 +1662,32 @@ class FSList:
             >>> lst.values()
             [2]
         """
-        ix = self.keys()[index]
-        return self.data.pop(ix)
+        return self._take(self._sorted_names()[index])
 
     def pop_left(self, timeout=-1.0, watchdog_timeout=19, wait=(0.0, 0.0), max_age=None):
         """Remove and return the first element. Safe with several consumers.
 
-        Consumers on any machine can call ``pop_left`` on the same list: a lock inside the
-        list directory makes sure that each element is returned to one consumer only.
+        Consumers on any machine can call ``pop_left`` on the same list. No lock is taken:
+        the consumer renames the file of the first element before reading it, and only one
+        rename can succeed, so each element is returned to one consumer only. A consumer
+        that loses the race takes the next element.
 
         Args:
-            timeout (float): Seconds to wait for the lock. Negative: wait without limit.
-                0: try once. Default -1.
-            watchdog_timeout (float): Seconds to wait for the filesystem event of the lock
-                release before checking again. Default 19.
-            wait (tuple): ``(min, max)`` random seconds to sleep after the event, to spread
-                competing consumers. Default ``(0.0, 0.0)``.
-            max_age (float, optional): If given, a lock older than this many seconds is
-                treated as left by a dead process and is broken. Default None: never.
+            timeout (float): Ignored. Accepted so that code written for ``FSListSimple``
+                keeps working; there is no lock to wait for.
+            watchdog_timeout (float): Ignored, as ``timeout``.
+            wait (tuple): ``(min, max)`` random seconds to sleep after losing an element to
+                another consumer, before trying the next one. Default ``(0.0, 0.0)``.
+            max_age (float, optional): Ignored, as ``timeout``.
 
         Returns:
             The first element.
 
         Raises:
             IndexError: If the list is empty.
-            LockingError: If the lock could not be taken within ``timeout``.
 
         See Also:
-            acquire_lock: Meaning of ``timeout``, ``watchdog_timeout``, ``wait`` and ``max_age``.
-            pop: Removal without a lock, for a single consumer.
+            pop: Removal by position, for a single consumer.
 
         Examples:
             >>> import tempfile
@@ -1519,20 +1705,16 @@ class FSList:
             ...     print("the queue is empty")
             the queue is empty
         """
-
-        def first():
-            try:
-                ix = self.keys()[0]
-            except IndexError:
-                raise IndexError("pop_left: empty list") from None
-            return self.data.pop(ix)
-
-        if self.fast:
-            return first()
-        with lock_context(self.data.base_path, "pop_left_lock", timeout, watchdog_timeout, wait, max_age):
-            return first()
-        # Unreachable in the original implementation, kept for reference:
-        # raise IndexError("pop_left: empty list")  # It should not happen
+        while True:
+            names = self._sorted_names()
+            if not names:
+                raise IndexError("pop_left: empty list")
+            for name in names:
+                try:
+                    return self._take(name)
+                except KeyError:  # another consumer took it: try the next one
+                    sleep(*wait)
+            # Every listed element was taken by others meanwhile: list again.
 
 
 # ---------------------------------------------------------------------------

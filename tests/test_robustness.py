@@ -106,6 +106,44 @@ def test_clear_ignores_files_removed_meanwhile(root, monkeypatch, no_sleep):
     assert len(d) == 0
 
 
+def test_take_file_gives_up_when_its_copy_is_moved_away(root):
+    """Windows: a second consumer's rename can land after ours and move our copy away."""
+
+    def steal_then_read(path):  # the late rename lands before we open our copy
+        os.replace(path, root / "stolen")
+        return Path(path).read_bytes()
+
+    def read_then_steal(path):  # the late rename lands after we read, before we delete
+        data = Path(path).read_bytes()
+        os.replace(path, root / "stolen")
+        return data
+
+    for loader in (steal_then_read, read_then_steal):
+        src = root / "src"
+        src.write_bytes(b"x")
+        with pytest.raises(FileNotFoundError):
+            structs._take_file(src, root / f"temp_{loader.__name__}", loader)
+        assert (root / "stolen").read_bytes() == b"x"  # the other consumer keeps it
+        (root / "stolen").unlink()
+
+    src = root / "src"
+    src.write_bytes(b"y")
+    assert structs._take_file(src, root / "temp", lambda p: Path(p).read_bytes()) == b"y"
+    assert not src.exists() and not (root / "temp").exists()
+
+
+def test_take_file_removes_an_unreadable_file_and_raises(root):
+    src = root / "src"
+    src.write_bytes(b"x")
+
+    def broken(path):
+        raise EOFError("truncated")
+
+    with pytest.raises(EOFError):
+        structs._take_file(src, root / "temp", broken)
+    assert not src.exists() and not (root / "temp").exists()
+
+
 def test_transient_network_oserror_is_retried(no_sleep):
     calls = {"n": 0}
 

@@ -8,6 +8,7 @@ import multiprocessing as mp
 
 import pytest
 
+from fs_structs.fslist_simple import FSListSimple
 from fs_structs.structs import FSList, FSUDict, lock_context
 
 N_ITEMS = 50
@@ -16,15 +17,17 @@ N_CONSUMERS = 2
 N_INCREMENTS = 50
 N_INCREMENTERS = 4
 
+LIST_CLASSES = {"FSList": FSList, "FSListSimple": FSListSimple}
 
-def _producer(root, tag, n):
-    queue = FSList(root / "queue", root / "tmp")
+
+def _producer(root, tag, n, cls_name="FSList"):
+    queue = LIST_CLASSES[cls_name](root / "queue", root / "tmp")
     for i in range(n):
         queue.append((tag, i))
 
 
-def _consumer(root, idx):
-    queue = FSList(root / "queue", root / "tmp")
+def _consumer(root, idx, cls_name="FSList"):
+    queue = LIST_CLASSES[cls_name](root / "queue", root / "tmp")
     taken = []
     while True:
         try:
@@ -49,14 +52,15 @@ def _run(processes, timeout=180):
     assert all(p.exitcode == 0 for p in processes), [p.exitcode for p in processes]
 
 
-def test_concurrent_consumers_take_each_item_exactly_once(root):
+@pytest.mark.parametrize("cls_name", list(LIST_CLASSES))
+def test_concurrent_consumers_take_each_item_exactly_once(root, cls_name):
     ctx = mp.get_context("spawn")
-    _run([ctx.Process(target=_producer, args=(root, tag, N_ITEMS)) for tag in "ab"[:N_PRODUCERS]])
+    _run([ctx.Process(target=_producer, args=(root, tag, N_ITEMS, cls_name)) for tag in "ab"[:N_PRODUCERS]])
 
-    queue = FSList(root / "queue", root / "tmp")
+    queue = LIST_CLASSES[cls_name](root / "queue", root / "tmp")
     assert len(queue) == N_PRODUCERS * N_ITEMS
 
-    _run([ctx.Process(target=_consumer, args=(root, i)) for i in range(N_CONSUMERS)])
+    _run([ctx.Process(target=_consumer, args=(root, i, cls_name)) for i in range(N_CONSUMERS)])
 
     results = FSUDict(root / "results", root / "tmp")
     per_consumer = [results[i] for i in range(N_CONSUMERS)]
@@ -72,6 +76,26 @@ def test_concurrent_consumers_take_each_item_exactly_once(root):
         for tag in "ab"[:N_PRODUCERS]:
             seq = [i for t, i in items if t == tag]
             assert seq == sorted(seq)
+
+
+def test_lock_free_pop_left_under_contention(root):
+    """FSList only: four consumers race on the same elements without any lock.
+
+    On Windows two renames of one file can both succeed (see _take_file); this test would
+    show duplicates or crashed consumers if the loser did not give the element up.
+    """
+    ctx = mp.get_context("spawn")
+    n_items, n_consumers = 100, 4
+    _run([ctx.Process(target=_producer, args=(root, tag, n_items, "FSList")) for tag in "ab"])
+
+    _run([ctx.Process(target=_consumer, args=(root, i, "FSList")) for i in range(n_consumers)])
+
+    results = FSUDict(root / "results", root / "tmp")
+    taken = [item for i in range(n_consumers) for item in results[i]]
+    expected = [(tag, i) for tag in "ab" for i in range(n_items)]
+    assert sorted(taken) == sorted(expected)  # every item once, none lost, none duplicated
+    assert len(FSList(root / "queue", root / "tmp")) == 0
+    assert list((root / "tmp").iterdir()) == []  # no temp file left behind
 
 
 def test_lock_serializes_processes(root):

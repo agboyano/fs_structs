@@ -2,6 +2,7 @@
 
 import copy
 import errno
+import random
 import threading
 import time
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from fs_structs import structs
+from fs_structs.fslist_simple import FSListSimple
 from fs_structs.structs import (
     FSList,
     FSNamespace,
@@ -173,9 +175,13 @@ def test_long_path_on_windows_gives_a_clear_error(root):
 
 # --------------------------------------------------------------------------- FSList
 
+# FSList (fast, own files) and FSListSimple (previous, on FSUDict) must behave the same.
+LIST_CLASSES = pytest.mark.parametrize("cls", [FSList, FSListSimple], ids=["FSList", "FSListSimple"])
 
-def test_list_behaves_like_a_python_list(root):
-    lst = FSList(root / "l", root / "tmp")
+
+@LIST_CLASSES
+def test_list_behaves_like_a_python_list(root, cls):
+    lst = cls(root / "l", root / "tmp")
     ref = []
 
     for i in range(20):
@@ -235,7 +241,7 @@ def test_list_behaves_like_a_python_list(root):
 
 
 def test_list_delitem_uses_the_sorted_order(root, monkeypatch):
-    lst = FSList(root / "l", root / "tmp")
+    lst = FSListSimple(root / "l", root / "tmp")
     lst.extend(["a", "b", "c"])
 
     original_keys = FSUDict.keys
@@ -245,16 +251,18 @@ def test_list_delitem_uses_the_sorted_order(root, monkeypatch):
     assert lst.values() == ["b", "c"]
 
 
-def test_list_items_are_value_key_pairs_in_order(root):
-    lst = FSList(root / "l", root / "tmp")
+@LIST_CLASSES
+def test_list_items_are_value_key_pairs_in_order(root, cls):
+    lst = cls(root / "l", root / "tmp")
     lst.extend([10, 20])
     items = lst.items()
     assert [v for v, _ in items] == [10, 20]
     assert [k for _, k in items] == lst.keys()
 
 
-def test_pop_left_is_fifo_and_raises_when_empty(root):
-    lst = FSList(root / "l", root / "tmp")
+@LIST_CLASSES
+def test_pop_left_is_fifo_and_raises_when_empty(root, cls):
+    lst = cls(root / "l", root / "tmp")
     lst.extend([1, 2, 3])
 
     assert [lst.pop_left(timeout=5) for _ in range(3)] == [1, 2, 3]
@@ -263,12 +271,136 @@ def test_pop_left_is_fifo_and_raises_when_empty(root):
     assert len(lst) == 0
     assert not (lst.base_path / "pop_left_lock.lock").exists()
 
-    fast = FSList(root / "f", root / "tmp", fast=True)
+    fast = cls(root / "f", root / "tmp", fast=True)
     fast.extend([1, 2])
     assert fast.pop_left() == 1
     with pytest.raises(IndexError):
         fast.pop_left()
         fast.pop_left()
+
+
+def test_fslist_and_fslistsimple_agree(root):
+    """The same scripted operations give the same values on both classes and on a list."""
+    a = FSList(root / "a", root / "tmp")
+    b = FSListSimple(root / "b", root / "tmp")
+    ref = []
+    rng = random.Random(20260917)
+    ops = ["append", "insert", "setitem", "pop", "pop0", "pop_left", "delitem", "extend", "setslice"]
+
+    for step in range(80):
+        op = rng.choice(ops)
+        n = len(ref)
+        if op == "append":
+            v = step
+            for lst in (a, b, ref):
+                lst.append(v)
+        elif op == "extend":
+            vs = [step, -step]
+            for lst in (a, b, ref):
+                lst.extend(vs)
+        elif op == "insert":
+            i = rng.randint(0, n)
+            for lst in (a, b, ref):
+                lst.insert(i, 1000 + step)
+        elif n == 0:
+            for lst in (a, b):
+                with pytest.raises(IndexError):
+                    lst.pop_left() if op == "pop_left" else lst.pop()
+            continue
+        elif op == "setitem":
+            i = rng.randint(-n, n - 1)
+            for lst in (a, b, ref):
+                lst[i] = 2000 + step
+        elif op == "setslice":
+            i = rng.randint(0, n)
+            j = rng.randint(i, n)
+            vs = [3000 + step + k for k in range(j - i)]  # same length: list semantics apply
+            for lst in (a, b, ref):
+                lst[i:j] = vs
+        elif op == "pop":
+            i = rng.randint(-n, n - 1)
+            assert a.pop(i) == b.pop(i) == ref.pop(i)
+        elif op == "pop0":
+            assert a.pop(0) == b.pop(0) == ref.pop(0)
+        elif op == "pop_left":
+            assert a.pop_left() == b.pop_left(timeout=5) == ref.pop(0)
+        elif op == "delitem":
+            i = rng.randint(-n, n - 1)
+            for lst in (a, b, ref):
+                del lst[i]
+
+        assert a.values() == b.values() == ref, (step, op)
+        assert len(a) == len(b) == len(ref)
+        assert [k for _, k in a.items()] == a.keys()
+        assert [v for v, _ in a.items()] == ref
+        assert list(a) == a.copy() == a[:] == ref
+        assert (step in a) == (step in b) == (step in ref)
+
+
+def test_fslist_names_sort_like_keys():
+    gen = structs.TimeOrderedTuple()
+    a, b = gen.new_rear_tuple(), gen.new_rear_tuple()
+    mid = gen.new_mid_tuple(a, b)
+    keys = [a, b, mid, gen.new_mid_tuple(a, mid), gen.new_front_tuple(), gen.new_front_tuple()]
+    keys += [(0,), (-1,), (-1, 5), (5, 3), (5, 3, 1), (5, 3, -(1 << 63)), ((1 << 63) - 1,), (-(1 << 63), 7)]
+
+    for key in keys:
+        assert structs._decode_key(structs._encode_key(key)) == key
+
+    names = [structs._encode_key(k) + ".jbl" for k in keys]
+    decoded_in_name_order = [FSList._key_of(n) for n in sorted(names)]
+    assert decoded_in_name_order == sorted(keys)
+
+    with pytest.raises(ValueError):
+        structs._encode_key((1 << 63,))
+
+
+def test_fslist_ignores_foreign_files(root):
+    lst = FSList(root / "l", root / "tmp")
+    lst.extend([1, 2])
+    acquire_lock(lst.base_path, "pop_left_lock")
+    (lst.base_path / "Thumbs.db").write_bytes(b"x")
+    (lst.base_path / ("f" * 15 + ".jbl")).write_bytes(b"x")  # 15 hex digits, not 16
+    (lst.base_path / ("f" * 16 + ".pkl")).write_bytes(b"x")  # other extension
+    (lst.base_path / ("g" * 16 + ".jbl")).write_bytes(b"x")  # not hex
+
+    assert len(lst) == 2
+    assert lst.values() == [1, 2]
+    assert lst.pop_left() == 1
+    release_lock(lst.base_path, "pop_left_lock")
+
+
+def test_pop_left_skips_elements_taken_by_others(root, monkeypatch):
+    lst = FSList(root / "l", root / "tmp")
+    lst.extend([1, 2, 3])
+    original = FSList._take
+    lost = []
+
+    def take(self, name):
+        if not lost:  # the first attempt loses the race: another consumer took the file
+            lost.append(name)
+            raise KeyError(name)
+        return original(self, name)
+
+    monkeypatch.setattr(FSList, "_take", take)
+    assert lst.pop_left() == 2
+    assert [lst.pop_left(), lst.pop_left()] == [1, 3]  # 1 was not really taken, so it is still there
+
+
+def test_pop_left_lists_again_when_every_listed_element_is_gone(root, monkeypatch):
+    lst = FSList(root / "l", root / "tmp")
+    lst.append("real")
+    stale = structs._encode_key((1, 1)) + ".jbl"  # a name that no longer exists on disk
+    original = FSList._names
+    calls = []
+
+    def names(self):
+        calls.append(1)
+        return [stale] if len(calls) == 1 else original(self)
+
+    monkeypatch.setattr(FSList, "_names", names)
+    assert lst.pop_left() == "real"
+    assert len(calls) == 2
 
 
 # --------------------------------------------------------------------------- FSNamespace

@@ -11,6 +11,8 @@ a network share (SMB, NFS). No server, no database: files, atomic renames and di
 - `FSList`: a list that can be used as a **FIFO queue** shared by several processes.
 - `FSNamespace`: a directory of named dicts, lists and sub-namespaces.
 - `lock_context`: one process at a time, on any machine.
+- `fs_structs.fslist_simple.FSListSimple`: the previous `FSList`, built on `FSUDict`. Same
+  behaviour, other file names; kept to read lists written by versions before 0.0.5.
 
 Every public class and function has runnable examples in its docstring: try
 `help(fs_structs.structs.FSUDict)`.
@@ -26,7 +28,7 @@ print(prices[("AAPL", "2026-01-02")], len(prices))
 
 queue = ns.list("requests")                # list / FIFO queue
 queue.append({"id": 1, "ticker": "AAPL"})
-job = queue.pop_left(timeout=60)           # safe with several consumers
+job = queue.pop_left()                     # safe with several consumers, no lock
 
 today = ns.list("today", clean=True)       # emptied (clear()) before it is returned
 ns.namespace("config").udict("user")["name"] = "Federico"   # chained: created on first use
@@ -61,9 +63,15 @@ Requires Python 3.9+, [joblib](https://joblib.readthedocs.io/) and
   which is atomic on local disks, SMB and NFS. Waiters wake up on the filesystem event of
   the release, with a timeout as fallback. With `max_age` a lock left behind by a dead
   process is broken (renamed, then removed) once it is older than that many seconds.
-- **Exactly-once queue consumption.** `FSList.pop_left` takes a lock inside the list
-  directory, so several consumers on several hosts never take the same element.
-  Producers do not lock: the atomic rename is enough.
+- **Exactly-once queue consumption.** `FSList.pop_left` renames the file of the first
+  element into `temp_dir`, reads it and deletes it. On Linux only one of several consumers
+  can win the rename. On Windows and on SMB shares the rename goes through a file handle
+  and two consumers can both succeed, the second moving the file away from the first; so a
+  consumer whose copy has vanished when it opens it, or when it deletes it after reading,
+  gives the element up. Exactly one consumer keeps each element, on one host or on several,
+  without a lock; a consumer that loses takes the next element. `FSUDict.pop` follows the
+  same protocol. Producers do not lock either: the atomic rename of the write is enough.
+  (`FSListSimple.pop_left`, the previous implementation, takes a directory lock as well.)
 - **Tolerance to transient errors.** `PermissionError` (Windows: a file open elsewhere) and
   transient network errors are retried a few times with a short random wait. Foreign files
   in a data directory (`Thumbs.db`, `desktop.ini`, orphan temp files) are ignored.
@@ -118,6 +126,12 @@ time with the local clock: keep clocks in sync and use minutes, not seconds.
 - `FSList` lists and sorts the directory on every indexed access: fine for queues and small
   lists, not for large random-access sequences. `items()` returns `(value, key)` pairs and
   slice assignment appends surplus values instead of inserting them.
+- `FSList` (0.0.5 and later) names its files differently from `FSListSimple` (the `FSList`
+  of 0.0.4 and earlier): the two classes do not see each other's elements. Drain or
+  `clear()` a queue written by an old version before using the new class, or read it with
+  `fs_structs.fslist_simple.FSListSimple`. `pop_left` keeps the `timeout`,
+  `watchdog_timeout` and `max_age` arguments for compatibility but ignores them: there is
+  no lock, and `LockingError` is never raised.
 - `clear()` (and `clean=True`) is an administrative operation: call it only when no other
   process is using the structure, for example when a job starts. It is not atomic: a value
   written at that moment may survive or be deleted, and `FSNamespace.clear()` also removes
