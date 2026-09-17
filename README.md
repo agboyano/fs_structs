@@ -52,7 +52,11 @@ Requires Python 3.9+, [joblib](https://joblib.readthedocs.io/) and
 - **Atomic writes.** `FSUDict.__setitem__` writes to `temp_dir` and renames onto the final
   name (`os.replace`). Readers see the previous value or the new one, never a partial file.
   `pop` renames the file away before reading it, so only one of several concurrent callers
-  gets a given key.
+  gets a given key. The value is flushed to disk (`fsync`) before the rename, but the rename
+  itself is not: a crash or power loss can lose the most recent writes, leaving an orphan
+  temp file, but can never leave a corrupt value. `fast=True` skips both the rename and
+  the fsync: about ten times faster on a local disk, but a reader or a crash can see a
+  partial file.
 - **Exclusive locks.** `acquire_lock` / `lock_context` create a directory with `os.mkdir`,
   which is atomic on local disks, SMB and NFS. Waiters wake up on the filesystem event of
   the release, with a timeout as fallback. With `max_age` a lock left behind by a dead

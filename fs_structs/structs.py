@@ -225,7 +225,9 @@ def _remove_contents(path, keep=()):
 
 # Implementation notes:
 # - dump() opens the file, calls _write(), then flush + fsync so the bytes reach the disk
-#   (or the file server) before FSUDict renames the file onto its final name.
+#   (or the file server) before FSUDict renames the file onto its final name. The fsync
+#   costs about 10 ms per file on a local disk; FSUDict skips it with fsync=False in fast
+#   mode.
 # - A subclass sets `extension`, `binary` (True: "wb"/"rb"; False: text, UTF-8) and
 #   implements _write(value, f) and _read(f) on an open file object.
 # - FSUDict only needs three attributes from a serializer: dump, load and extension.
@@ -264,12 +266,14 @@ class Serializer:
     extension = ""
     binary = True
 
-    def dump(self, value, filename):
-        """Write ``value`` to ``filename`` and make sure it reaches the disk.
+    def dump(self, value, filename, fsync=True):
+        """Write ``value`` to ``filename`` and, by default, make sure it reaches the disk.
 
         Args:
             value: The object to store.
             filename (str | Path): File to create or overwrite.
+            fsync (bool): If True (default), wait until the bytes are on the disk before
+                returning. ``FSUDict`` passes False in fast mode.
 
         Examples:
             >>> import tempfile
@@ -284,7 +288,8 @@ class Serializer:
         with open(filename, mode, **kwargs) as f:
             self._write(value, f)
             f.flush()
-            os.fsync(f.fileno())
+            if fsync:
+                os.fsync(f.fileno())
 
     def load(self, filename):
         """Read the value stored in ``filename``.
@@ -463,6 +468,11 @@ json_serializer = JsonSerializer()
 # - Write (fast=False): dump to temp_dir/tmp_<uuid>, then Path.replace onto the final
 #   name. os.replace is atomic on the same volume; across volumes it fails (EXDEV /
 #   WinError 17) and we raise a clear ValueError.
+# - Durability: dump() fsyncs the data, but nothing fsyncs the rename (that would need an
+#   fsync of the directory on POSIX or MOVEFILE_WRITE_THROUGH on Windows). A crash can
+#   lose the most recent writes, leaving an orphan temp file, but can never leave a corrupt
+#   value: the final name always holds a complete old or new value. With fast=True there
+#   is no rename and no fsync at all: a crash can leave a partial file.
 # - Network shares: on an SMB/Samba or NFS share the rename is executed by the server,
 #   so it stays atomic for every client as long as temp_dir is on the same share (the
 #   default base_path/tmp is). Verified on an SMB share from Windows: the whole suite,
@@ -508,9 +518,10 @@ class FSUDict:
         base_path (str | Path): Directory where the values are stored. Created if missing.
         temp_dir (str | Path): Directory for temporary files. Same volume as ``base_path``.
         serializer (Serializer): How values are written and read. Default: joblib.
-        fast (bool): If True, values are written directly, without atomic operations.
-            Faster, but not safe for distributed processes: a reader may see a partial
-            file. Default False.
+        fast (bool): If True, values are written directly, without the atomic rename and
+            without fsync. Much faster, but not safe for distributed processes (a reader
+            may see a partial file) nor against a crash (a partial file may remain).
+            Default False.
         clean (bool): If True, the dict is emptied (``clear()``) before it is returned.
             Default False. ``clean=True`` is not atomic (see ``clear()``).
 
@@ -681,7 +692,7 @@ class FSUDict:
         target_path = self.base_path / self._key_to_filename(key)
 
         if self.fast:
-            _retry(lambda: self.dump(value, target_path))
+            _retry(lambda: self.dump(value, target_path, fsync=False))
             return
 
         temp_path = self._temp_path()
@@ -1121,9 +1132,9 @@ class FSList:
         base_path (str | Path): Directory where the elements are stored. Created if missing.
         temp_dir (str | Path): Directory for temporary files. Same volume as ``base_path``.
         serializer (Serializer): How elements are written and read. Default: joblib.
-        fast (bool): If True, elements are written without atomic operations and
-            ``pop_left`` takes no lock. Faster, but not safe for distributed processes.
-            Default False.
+        fast (bool): If True, elements are written without the atomic rename and without
+            fsync, and ``pop_left`` takes no lock. Much faster, but not safe for
+            distributed processes nor against a crash. Default False.
         clean (bool): If True, the list is emptied (``clear()``) before it is returned.
             Default False. ``clean=True`` is not atomic (see ``clear()``).
 

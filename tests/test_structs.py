@@ -105,13 +105,22 @@ def test_udict_dict_as_key(root):
     assert d.keys() == [key]
 
 
-def test_udict_fast_mode(root):
+def test_udict_fast_mode(root, monkeypatch):
+    fsyncs = []
+    monkeypatch.setattr(structs.os, "fsync", lambda fd: fsyncs.append(fd))
+
     d = FSUDict(root / "d", root / "tmp", fast=True)
     d["k"] = [1, 2]
+    assert fsyncs == []  # fast mode: no fsync
     assert d["k"] == [1, 2]
     assert d.pop("k") == [1, 2]
     assert "k" not in d
     assert list((root / "tmp").iterdir()) == []
+
+    safe = FSUDict(root / "s", root / "tmp")
+    safe["k"] = [1, 2]
+    assert len(fsyncs) == 1  # default mode: one fsync per write
+    assert safe["k"] == [1, 2]
 
 
 def test_json_serializer_reads_utf8_on_every_platform(root):
