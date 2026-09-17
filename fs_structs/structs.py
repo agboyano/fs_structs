@@ -215,9 +215,14 @@ def _remove_contents(path, keep=()):
         except FileNotFoundError:
             pass  # deleted by someone else meanwhile
 
-    # pool.map raises the first error, but leaving the "with" block waits for every unlink.
+    # Not pool.map: its iterator cancels the unlinks that have not started yet as soon as
+    # one of them raises, so files could survive on a slow machine. Wait for every future,
+    # then raise the first error.
     with ThreadPoolExecutor(max_workers=CLEAR_THREADS) as pool:
-        list(pool.map(unlink, files))
+        errors = [f.exception() for f in [pool.submit(unlink, p) for p in files]]
+    for error in errors:
+        if error is not None:
+            raise error
 
 
 def _replace(src, dst):
